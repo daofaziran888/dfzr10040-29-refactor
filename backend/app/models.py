@@ -44,6 +44,7 @@ class SchemaMapping:
     missing_value_policy: str
     mapping_order: str
     plan_status: str
+    version: int = 1
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -308,6 +309,9 @@ class ExportPlan:
     export_path: str
     row_limit: int = 0
     export_status: str = "待导出"
+    delivered_rows: int = 0
+    cursor_snapshot_id: int = 0
+    pinned_basis: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

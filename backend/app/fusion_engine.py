@@ -29,6 +29,12 @@ from app.models import (
     WatermarkRecord,
     WideTableDef,
 )
+from app.projection import (
+    ProjectionBasis,
+    ProjectionOutcome,
+    default_row_key,
+    field_projector,
+)
 
 
 def _now_iso() -> str:
@@ -86,6 +92,12 @@ class FusionEngine:
                               field_mapping_json: str, type_conversion: str = "",
                               missing_policy: str = "skip") -> SchemaMapping:
         sid = self._next_seq()
+        version = 1 + max(
+            (m.version for m in self._schemas.values()
+             if m.source_table == source_table
+             and m.target_wide_table == target_wide_table),
+            default=0,
+        )
         mapping = SchemaMapping(
             mapping_id=sid, plan_code=_generate_code("SCHE", sid),
             source_table=source_table, target_wide_table=target_wide_table,
@@ -93,8 +105,17 @@ class FusionEngine:
             type_conversion_rules=type_conversion,
             missing_value_policy=missing_policy,
             mapping_order="ASC", plan_status="草稿",
+            version=version,
         )
         self._schemas[sid] = mapping
+        return mapping
+
+    def publish_schema_mapping(self, mapping_id: int) -> SchemaMapping | None:
+        """发布映射方案：发布后成为该源表到宽表当前生效的列声明版本。"""
+        mapping = self._schemas.get(mapping_id)
+        if mapping is None:
+            return None
+        mapping.plan_status = "已发布"
         return mapping
 
     def define_wide_table(self, table_code: str, table_name: str,
@@ -394,7 +415,9 @@ class FusionEngine:
                 rec["_version"] = 1
             raw_records.extend(source_records)
 
-        mapped_records = self._apply_schema_mappings(raw_records, job.target_wide_table)
+        mapping_outcome = self._project_records_with_mappings(
+            raw_records, job.target_wide_table)
+        mapped_records = mapping_outcome.records
 
         job.output_rows = len(mapped_records)
         job.skipped_rows = len(raw_records) - len(mapped_records)
@@ -408,6 +431,7 @@ class FusionEngine:
             "mapped_records": len(mapped_records),
             "skipped_records": job.skipped_rows,
             "records": mapped_records,
+            "projection": mapping_outcome.audit(),
         }
 
         conflict_result = self._apply_conflict_resolution(mapped_records, job.target_wide_table)
@@ -541,7 +565,11 @@ class FusionEngine:
 
     def execute_export_from_snapshot(self, export_id: int,
                                      snapshot_id: int) -> dict[str, Any]:
-        """从分区快照执行数据导出。"""
+        """从分区快照执行数据导出。
+
+        每次交付最多 row_limit 行；中断后按断点续读，
+        同次导出的各次交付沿用首次钉住的列和明细版本。
+        """
         plan = self._exports.get(export_id)
         snap = self._snapshots.get(snapshot_id)
         if plan is None:
@@ -552,25 +580,92 @@ class FusionEngine:
         fusion_job = self._find_fusion_job_by_table(snap.target_wide_table)
         records = fusion_job.merged_records if fusion_job else []
 
-        if plan.field_filter:
-            records = [
-                {k: v for k, v in rec.items() if k in plan.field_filter}
-                for rec in records
-            ]
+        resumed = (
+            bool(plan.pinned_basis)
+            and plan.cursor_snapshot_id == snapshot_id
+            and plan.delivered_rows > 0
+            and plan.export_status in ("导出中", "导出失败")
+        )
+        if not resumed:
+            # 首次取数：钉住本次导出的字段投影依据（列选择 + 明细版本）
+            plan.pinned_basis = self._build_export_basis(plan, snap)
+            plan.delivered_rows = 0
+            plan.cursor_snapshot_id = snapshot_id
 
-        if plan.row_limit > 0 and len(records) > plan.row_limit:
-            records = records[:plan.row_limit]
+        pinned = plan.pinned_basis
+        basis = ProjectionBasis(
+            origin="export_snapshot",
+            requested=tuple(pinned.get("requested", [])),
+            columns=tuple(pinned.get("columns", [])),
+            version=pinned.get("version", "无映射"),
+            detail=dict(pinned.get("detail", {})),
+        )
 
-        plan.export_status = "已完成"
+        start = plan.delivered_rows
+        if plan.row_limit > 0:
+            batch = records[start:start + plan.row_limit]
+        else:
+            batch = records[start:]
+
+        if basis.columns:
+            outcome = field_projector.project_records(batch, basis.columns, basis=basis)
+            delivered = outcome.records
+        else:
+            delivered = list(batch)
+            outcome = ProjectionOutcome(delivered, basis)
+
+        plan.delivered_rows = start + len(batch)
+        complete = plan.delivered_rows >= len(records)
+        plan.export_status = "已完成" if complete else "导出中"
+        if complete:
+            plan.cursor_snapshot_id = 0
 
         return {
             "ok": True,
             "plan_code": plan.plan_code,
             "snapshot_code": snap.partition_code,
-            "exported_rows": len(records),
+            "exported_rows": len(delivered),
             "format": plan.export_format,
             "path": plan.export_path,
-            "records": records,
+            "records": delivered,
+            "resumed": resumed,
+            "complete": complete,
+            "delivered_rows": plan.delivered_rows,
+            "projection": outcome.audit(),
+        }
+
+    def interrupt_export(self, export_id: int) -> dict[str, Any]:
+        """中断进行中的导出：保留断点与钉住的投影依据，下次执行按原版本续读。"""
+        plan = self._exports.get(export_id)
+        if plan is None:
+            return {"ok": False, "message": f"导出计划 {export_id} 不存在"}
+        if plan.export_status != "导出中":
+            return {
+                "ok": False,
+                "message": f"导出计划 {export_id} 状态为{plan.export_status}，不在导出中",
+            }
+        plan.export_status = "导出失败"
+        return {
+            "ok": True,
+            "plan_code": plan.plan_code,
+            "delivered_rows": plan.delivered_rows,
+            "projection": dict(plan.pinned_basis),
+        }
+
+    def _build_export_basis(self, plan: ExportPlan,
+                            snap: SnapshotPartition) -> dict[str, Any]:
+        """首次取数时钉住字段投影依据：请求的列、生效明细版本与解析后的实际字段。"""
+        active = self._active_mappings_for_table(snap.target_wide_table)
+        detail = self._mapping_detail(active)
+        requested = list(plan.field_filter)
+        return {
+            "requested": requested,
+            "columns": (
+                field_projector.resolve_columns(requested, detail) if requested else []
+            ),
+            "version": self._mapping_version_label(active),
+            "detail": detail,
+            "pinned_at": _now_iso(),
         }
 
     def execute_cross_validation(self, plan_id: int) -> dict[str, Any]:
@@ -771,31 +866,96 @@ class FusionEngine:
     def _apply_schema_mappings(self, records: list[dict[str, Any]],
                                target_wide_table: str) -> list[dict[str, Any]]:
         """应用 Schema 映射：对关联到目标宽表的映射方案进行字段转换。"""
-        relevant = [
-            m for m in self._schemas.values()
-            if m.target_wide_table == target_wide_table
-        ]
-        if not relevant:
-            return list(records)
+        return self._project_records_with_mappings(records, target_wide_table).records
 
+    def _project_records_with_mappings(self, records: list[dict[str, Any]],
+                                       target_wide_table: str) -> ProjectionOutcome:
+        """按当前生效的映射版本取字段，返回投影结果与投影依据。"""
+        active = self._active_mappings_for_table(target_wide_table)
+        detail = self._mapping_detail(active)
+        basis = ProjectionBasis(
+            origin="schema_map",
+            requested=tuple(detail.keys()),
+            columns=tuple(detail.values()),
+            version=self._mapping_version_label(active),
+            detail=detail,
+        )
+        if not active:
+            return ProjectionOutcome(list(records), basis)
+
+        parsed = {
+            source_table: self._parse_field_map(mapping.field_mapping_json)
+            for source_table, mapping in active.items()
+        }
         mapped: list[dict[str, Any]] = []
-        for rec in records:
-            source_table = rec.get("_source", "")
-            applicable = [m for m in relevant if m.source_table == source_table]
-            if applicable:
-                new_rec = dict(rec)
-                for mapping in applicable:
-                    try:
-                        field_map = json.loads(mapping.field_mapping_json)
-                        for src_field, tgt_field in field_map.items():
-                            if src_field in new_rec:
-                                new_rec[tgt_field] = new_rec.pop(src_field)
-                    except (json.JSONDecodeError, KeyError):
-                        pass
-                mapped.append(new_rec)
-            else:
+        defaults_applied = 0
+        incomplete: list[dict[str, Any]] = []
+        for index, rec in enumerate(records):
+            renames = parsed.get(rec.get("_source", ""))
+            if not renames:
                 mapped.append(rec)
-        return mapped
+                continue
+            outcome = field_projector.rename_records(
+                [rec], renames, basis=basis,
+                row_key=lambda record, _pos, idx=index: default_row_key(record, idx),
+            )
+            mapped.extend(outcome.records)
+            defaults_applied += outcome.defaults_applied
+            incomplete.extend(outcome.incomplete_rows)
+        return ProjectionOutcome(mapped, basis, defaults_applied, incomplete)
+
+    def _active_schema_mapping(self, source_table: str,
+                               target_wide_table: str) -> SchemaMapping | None:
+        """当前生效的映射版本：已发布的最新版本优先，无已发布时退到最新草稿。"""
+        candidates = [
+            m for m in self._schemas.values()
+            if m.source_table == source_table
+            and m.target_wide_table == target_wide_table
+        ]
+        if not candidates:
+            return None
+        published = [m for m in candidates if m.plan_status == "已发布"]
+        pool = published or candidates
+        return max(pool, key=lambda m: m.version)
+
+    def _active_mappings_for_table(self, target_wide_table: str) -> dict[str, SchemaMapping]:
+        """目标宽表当前生效的映射版本，按源表去重。"""
+        active: dict[str, SchemaMapping] = {}
+        for mapping in self._schemas.values():
+            if mapping.target_wide_table != target_wide_table:
+                continue
+            current = self._active_schema_mapping(
+                mapping.source_table, target_wide_table)
+            if current is not None:
+                active[mapping.source_table] = current
+        return active
+
+    @staticmethod
+    def _parse_field_map(field_mapping_json: str) -> dict[str, str]:
+        try:
+            field_map = json.loads(field_mapping_json)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        if not isinstance(field_map, dict):
+            return {}
+        return {str(src): str(tgt) for src, tgt in field_map.items()}
+
+    @classmethod
+    def _mapping_detail(cls, mappings: dict[str, SchemaMapping]) -> dict[str, str]:
+        """汇总生效映射的重命名明细（源字段 -> 目标字段）。"""
+        detail: dict[str, str] = {}
+        for mapping in mappings.values():
+            detail.update(cls._parse_field_map(mapping.field_mapping_json))
+        return detail
+
+    @staticmethod
+    def _mapping_version_label(mappings: dict[str, SchemaMapping]) -> str:
+        if not mappings:
+            return "无映射"
+        return ",".join(
+            f"{mapping.plan_code}#v{mapping.version}"
+            for mapping in mappings.values()
+        )
 
     def _apply_conflict_resolution(self, records: list[dict[str, Any]],
                                    target_wide_table: str) -> dict[str, Any]:
